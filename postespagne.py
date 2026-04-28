@@ -221,6 +221,14 @@ def afficher_aide_credentials() -> None:
 """)
 
 
+# ─── CONFIGURATION RAPIDE ────────────────────────────────────────────────────
+# Collez directement vos valeurs ici pour ne plus avoir à les saisir à chaque fois.
+# Laissez "" pour que le script vous les demande au lancement.
+
+SHEET_URL      = ""   # ex: "https://docs.google.com/spreadsheets/d/XXXX..."
+CREDENTIALS    = ""   # ex: "credentials.json"  ou chemin absolu
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -240,14 +248,13 @@ def main() -> None:
         sys.exit(1)
 
     # 2. Google Sheet (URL ou ID)
-    sheet_input = input("URL ou ID de votre Google Sheet : ").strip()
+    sheet_input = SHEET_URL or input("URL ou ID de votre Google Sheet : ").strip()
     if not sheet_input:
         print("Erreur : URL/ID du Sheet manquant.")
         sys.exit(1)
 
     # 3. Fichier credentials
-    creds_input = input("Chemin vers credentials.json [credentials.json] : ").strip()
-    creds_file  = creds_input if creds_input else "credentials.json"
+    creds_file = CREDENTIALS or input("Chemin vers credentials.json [credentials.json] : ").strip() or "credentials.json"
 
     if not os.path.isfile(creds_file):
         print(f"\nFichier credentials.json introuvable → {creds_file}")
