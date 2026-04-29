@@ -222,6 +222,10 @@ def parse_buildings(gml_content):
 
         estimation = round((superficie / etages_calc) * 1.10, 2)
 
+        # Exclure les batiments avec une surface aberrante (> 500m² = pas une maison)
+        if estimation > 550:
+            continue
+
         resultats.append({
             "Referencia_Catastral": ref[:14] if len(ref) >= 14 else ref,
             "Ano": anyo,
@@ -234,33 +238,61 @@ def parse_buildings(gml_content):
 # ─── PARSE ADRESSES ───────────────────────────────────────────────────────────
 
 def parse_addresses(gml_content):
-    """Extrait les adresses depuis le GML INSPIRE."""
+    """
+    Extrait les adresses depuis le GML INSPIRE espagnol.
+    localId format: {prov}.{muni}.{street_code}.{numero}.{refcat}
+    """
     root = ET.fromstring(gml_content)
-    adresses = {}
+    NS_GML   = "http://www.opengis.net/gml/3.2"
+    NS_XLINK = "http://www.w3.org/1999/xlink"
 
+    # 1. Rues : TN.{prov}.{muni}.{code} → nom de rue
+    street_names = {}
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] == "ThoroughfareName":
+            gml_id = elem.get(f"{{{NS_GML}}}id", "")
+            code = gml_id.split(".")[-1]
+            for child in elem.iter():
+                if child.tag.split("}")[-1] == "text":
+                    street_names[code] = (child.text or "").strip().title()
+                    break
+
+    # 2. Codes postaux : PD.{prov}.{muni}.{cp} → code postal
+    postal = {}
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] == "PostalDescriptor":
+            gml_id = elem.get(f"{{{NS_GML}}}id", "")
+            last = gml_id.split(".")[-1]
+            if last.isdigit() and len(last) == 5:
+                postal[gml_id] = last
+
+    # 3. Adresses : localId → {Calle, Numero, CP}
+    adresses = {}
     for elem in root.iter():
         if elem.tag.split("}")[-1] != "Address":
             continue
-
-        ref = None
+        lid = None
         for child in elem.iter():
             if child.tag.split("}")[-1] == "localId":
-                ref = (child.text or "").strip()[:14]
+                lid = (child.text or "").strip()
                 break
-        if not ref:
+        if not lid:
             continue
-
-        calle, numero, cp = "", "", ""
+        parts = lid.split(".")
+        if len(parts) < 5:
+            continue
+        refcat      = parts[-1]          # ex: 0902901TM7000S
+        numero      = parts[-2]          # ex: S-N ou 5
+        street_code = parts[2]           # ex: 1
+        calle = street_names.get(street_code, "")
+        cp    = ""
         for child in elem.iter():
-            cn = child.tag.split("}")[-1]
-            if cn in ("thoroughfareName", "ThoroughfareName"):
-                calle = (child.text or "").strip().title()
-            elif cn in ("designator", "locatorDesignator") and not numero:
-                numero = (child.text or "").strip()
-            elif cn == "postCode":
-                cp = (child.text or "").strip()
-
-        adresses[ref] = {"Calle": calle, "Numero": numero, "CP": cp}
+            if child.tag.split("}")[-1] == "component":
+                href = child.get(f"{{{NS_XLINK}}}href", "")
+                if "SDGC.PD." in href:
+                    pd_id = href.lstrip("#")
+                    cp = postal.get(pd_id, pd_id.split(".")[-1])
+        adresses[refcat] = {"Calle": calle, "Numero": numero, "CP": cp}
 
     return adresses
 
@@ -302,7 +334,9 @@ def main():
         print(f"\nVille '{city}' introuvable.")
         print("Conseil : utilisez le nom espagnol (ex: Malaga, Valencia, Sevilla, Alicante)")
         sys.exit(1)
-    print(f"Trouve : {muni_name} (province {prov_code})")
+    # Nettoyer le nom : "49900-ZAMORA buildings" -> "ZAMORA"
+    muni_clean = re.sub(r'^\d+-', '', muni_name).replace(' buildings', '').strip().title()
+    print(f"Trouve : {muni_clean} (province {prov_code})")
 
     # 2. Batiments
     print("\nBatiments INSPIRE :")
@@ -335,7 +369,7 @@ def main():
             "Calle":                 addr.get("Calle", ""),
             "Numero":                addr.get("Numero", ""),
             "CP":                    addr.get("CP", ""),
-            "Municipio":             muni_name,
+            "Municipio":             muni_clean,
             "Ano":                   b["Ano"],
             "Estimation_M2_Combles": b["Estimation_M2_Combles"],
             "Statut_Appel":          "",
