@@ -180,19 +180,25 @@ def parse_buildings(gml_content):
                     pass
 
         # ── FILTRES ──────────────────────────────────────────────────────────
+        # Annee obligatoire
         if not (ANNEE_MIN <= anyo <= ANNEE_MAX):
             continue
-        if plantas == 0 or plantas > ETAGES_MAX:
+        # Etages : si nil (0) on accepte, si connu et > max on rejette
+        if plantas > ETAGES_MAX:
             continue
+        # Usage resididentiel
         if usage and not any(k in usage for k in ("residential", "1_", "vivienda", "residencial")):
             continue
+        # Unifamiliar : 1 logement (ou non renseigne)
         if nb_logements > 1:
             continue
 
+        # Estimation surface : officialArea si dispo, sinon 80m2/etage
+        etages_calc = max(plantas, 1)
         if superficie <= 0:
-            superficie = 80.0 * plantas  # estimation si surface inconnue
+            superficie = 80.0 * etages_calc
 
-        estimation = round((superficie / plantas) * 1.10, 2)
+        estimation = round((superficie / etages_calc) * 1.10, 2)
 
         resultats.append({
             "Referencia_Catastral": ref[:14] if len(ref) >= 14 else ref,
