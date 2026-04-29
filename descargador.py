@@ -357,8 +357,7 @@ def calculer_scoring(superficie: float, anyo: int) -> dict:
     )
 
     # ── Combles nets ─────────────────────────────────────────────────────────
-    combles_bruts = round((superficie / 1) * 1.10, 1)  # surface totale × 1.10
-    combles_nets  = round(max(0, combles_bruts - deduction), 1)
+    combles_nets  = round(max(0, superficie - deduction), 1)
 
     # ── Score 1-5 ────────────────────────────────────────────────────────────
     if combles_nets >= 100:
