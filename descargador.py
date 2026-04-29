@@ -1,40 +1,152 @@
 #!/usr/bin/env python3
 """
-descargador.py — Telechargement automatique Cadastre ES -> Google Sheets
-Recherche une ville espagnole, telecharge les donnees INSPIRE,
-filtre les maisons individuelles et exporte vers Google Sheets.
+descargador.py — Cadastre INSPIRE + enrichissement OVC exact → CSV / Google Sheets
+Filtre les maisons individuelles et calcule les combles exacts par soustraction.
 
 Usage:
-    python3 descargador.py
-    python3 descargador.py "Malaga"
-    python3 descargador.py "Valencia"
+    python3 descargador.py "Zamora"
+    python3 descargador.py "Zamora" "Morales del Vino" "Villaralbo"
 """
 
-import sys, re, os, zipfile, io, requests, pandas as pd
+import sys, re, os, zipfile, io, time, requests, pandas as pd
 from xml.etree import ElementTree as ET
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ─── CONFIG RAPIDE ────────────────────────────────────────────────────────────
-SHEET_URL   = ""   # ex: "https://docs.google.com/spreadsheets/d/..."
-CREDENTIALS = ""   # ex: "credentials.json"
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+SHEET_URL   = ""
+CREDENTIALS = ""
 
 ANNEE_MIN, ANNEE_MAX = 1960, 2006
-ETAGES_MAX = 2
+ETAGES_MAX  = 2
+OVC_WORKERS = 8   # Requetes paralleles vers l'API Catastro
+
 COLONNES_SORTIE = [
     "Referencia_Catastral", "Calle", "Numero", "CP", "Municipio", "Ano",
-    "Surface_Totale_M2", "Proba_Garage_pct", "Proba_Cave_pct",
-    "Deduction_Estimee_M2", "Combles_Nets_M2", "Score", "Statut_Appel"
+    "Surface_Totale_M2", "Surface_Habitable_M2", "Surface_Garage_M2",
+    "Surface_Cave_M2", "Combles_Nets_M2", "Score", "Statut_Appel",
 ]
 
-# ─── INSPIRE CATASTRO ─────────────────────────────────────────────────────────
+# ─── INSPIRE URLS ─────────────────────────────────────────────────────────────
 ATOM_BU = "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
 ATOM_AD = "https://www.catastro.hacienda.gob.es/INSPIRE/addresses/ES.SDGC.AD.atom.xml"
 NS_A    = "http://www.w3.org/2005/Atom"
 
+# ─── OVC API ──────────────────────────────────────────────────────────────────
+OVC_URL = "https://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC"
+
+# Codes usage du cadastre espagnol
+USOS_HABITABLE = {"VIV", "VV", "VI", "VT", "VP", "V"}
+USOS_GARAGE    = {"GAR", "GA", "GR", "PAR", "G"}
+USOS_CAVE      = {"TRS", "ALM", "BOD", "TRO", "DEP", "TR", "AL"}
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "PostEspagne/1.0"})
 
-# ─── RECHERCHE VILLE ──────────────────────────────────────────────────────────
+# ─── SCORING ──────────────────────────────────────────────────────────────────
+
+def calculer_score(combles: float) -> int:
+    if combles >= 100: return 5
+    if combles >= 70:  return 4
+    if combles >= 45:  return 3
+    if combles >= 25:  return 2
+    return 1
+
+# ─── OVC ENRICHISSEMENT EXACT ─────────────────────────────────────────────────
+
+def get_exact_ovc(ref: str) -> dict:
+    """Interroge l'API OVC pour obtenir les surfaces exactes d'une propriete."""
+    try:
+        r = SESSION.get(OVC_URL, params={"RefCatastral": ref}, timeout=15)
+        if r.status_code != 200:
+            return {}
+        root = ET.fromstring(r.content)
+        surf_hab = surf_gar = surf_cave = 0.0
+        for elem in root.iter():
+            if elem.tag.split("}")[-1] != "cons":
+                continue
+            lcd = scd = None
+            for ch in elem.iter():
+                t = ch.tag.split("}")[-1]
+                if t == "lcd":
+                    lcd = (ch.text or "").strip().upper()
+                elif t == "scd":
+                    try:
+                        scd = float(ch.text or 0)
+                    except ValueError:
+                        pass
+            if lcd and scd and scd > 0:
+                if lcd in USOS_HABITABLE:
+                    surf_hab += scd
+                elif lcd in USOS_GARAGE:
+                    surf_gar += scd
+                elif lcd in USOS_CAVE:
+                    surf_cave += scd
+        return {
+            "surf_hab":  round(surf_hab, 1),
+            "surf_gar":  round(surf_gar, 1),
+            "surf_cave": round(surf_cave, 1),
+        }
+    except Exception:
+        return {}
+
+
+def enrichir_exact(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pour chaque propriete du DataFrame, appelle l'API OVC en parallele
+    et recalcule les combles exacts = total - habitable - garage - cave.
+    Proprietes avec combles = 0 sont conservees mais avec Score 1.
+    """
+    refs = df["Referencia_Catastral"].tolist()
+    resultats = {}
+
+    print(f"\nEnrichissement exact via OVC ({len(refs)} proprietes, {OVC_WORKERS} connexions)...")
+    print("Cela prend ~2-4 minutes...")
+
+    with ThreadPoolExecutor(max_workers=OVC_WORKERS) as executor:
+        futures = {executor.submit(get_exact_ovc, ref): ref for ref in refs}
+        for future in tqdm(as_completed(futures), total=len(refs), desc="OVC API", unit="prop"):
+            ref = futures[future]
+            try:
+                data = future.result()
+                if data:
+                    resultats[ref] = data
+            except Exception:
+                pass
+
+    ok = len(resultats)
+    print(f"-> {ok}/{len(refs)} proprietes enrichies avec donnees exactes")
+
+    rows = []
+    for _, row in df.iterrows():
+        ref  = row["Referencia_Catastral"]
+        data = resultats.get(ref)
+        row  = row.copy()
+        surf = row["Surface_Totale_M2"]
+
+        if data:
+            s_hab  = data["surf_hab"]
+            s_gar  = data["surf_gar"]
+            s_cave = data["surf_cave"]
+            combles = round(max(0, surf - s_hab - s_gar - s_cave), 1)
+            # Si OVC ne retourne aucun usage → fallback 20%
+            if s_hab == 0 and s_gar == 0 and s_cave == 0:
+                combles = round(surf * 0.20, 1)
+        else:
+            # OVC indisponible → estimation conservative 15%
+            s_hab = s_gar = s_cave = 0.0
+            combles = round(surf * 0.15, 1)
+
+        row["Surface_Habitable_M2"] = s_hab
+        row["Surface_Garage_M2"]   = s_gar
+        row["Surface_Cave_M2"]     = s_cave
+        row["Combles_Nets_M2"]     = combles
+        row["Score"]               = calculer_score(combles)
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=COLONNES_SORTIE)
+
+# ─── INSPIRE : RECHERCHE VILLE ────────────────────────────────────────────────
 
 def get_entries(url):
     r = SESSION.get(url, timeout=30)
@@ -53,18 +165,9 @@ def get_entries(url):
 
 
 def find_zip_url(city_name, atom_url, province_code=None):
-    """
-    Parcourt le flux ATOM national puis les flux provinciaux
-    pour trouver l'URL du ZIP de la ville demandee.
-    Si province_code est fourni, va directement au bon feed (beaucoup plus rapide).
-    Retourne (muni_name, zip_url, province_code_trouve).
-    """
     city_up = city_name.strip().upper()
-
-    # Niveau 1 : flux national
     entries = get_entries(atom_url)
 
-    # Si on connait deja le code province, aller directement
     if province_code:
         for e in entries:
             for href, typ, _ in e["links"]:
@@ -79,14 +182,12 @@ def find_zip_url(city_name, atom_url, province_code=None):
                     except Exception:
                         pass
 
-    # Chercher directement au niveau national
     for e in entries:
         if city_up in e["title"].upper():
             for href, typ, _ in e["links"]:
                 if href.endswith(".zip") or typ == "application/zip":
                     return e["title"], href, None
 
-    # Niveau 2 : flux provinciaux (avec extraction du code province)
     province_feeds = []
     for e in entries:
         for href, typ, _ in e["links"]:
@@ -94,7 +195,6 @@ def find_zip_url(city_name, atom_url, province_code=None):
                 province_feeds.append(href)
 
     for pf_url in tqdm(province_feeds, desc="Recherche dans les provinces", unit="prov"):
-        # Extraire le code province depuis l'URL (ex: .../buildings/49/ES...)
         pcode = None
         m = re.search(r"/(\d{2})/", pf_url)
         if m:
@@ -111,10 +211,9 @@ def find_zip_url(city_name, atom_url, province_code=None):
 
     return None, None, None
 
-# ─── TELECHARGEMENT ───────────────────────────────────────────────────────────
+# ─── INSPIRE : TELECHARGEMENT ─────────────────────────────────────────────────
 
 def download_gml_from_zip(zip_url):
-    """Telecharge un ZIP et retourne le contenu du premier fichier GML."""
     r = SESSION.get(zip_url, timeout=300, stream=True)
     r.raise_for_status()
     total = int(r.headers.get("content-length", 0))
@@ -130,10 +229,9 @@ def download_gml_from_zip(zip_url):
             raise ValueError("Pas de fichier GML dans le ZIP")
         return z.read(gml_names[0])
 
-# ─── PARSE BATIMENTS ──────────────────────────────────────────────────────────
+# ─── INSPIRE : PARSE BATIMENTS ────────────────────────────────────────────────
 
 def parse_buildings(gml_content):
-    """Extrait les batiments qualifies depuis le GML INSPIRE."""
     root = ET.fromstring(gml_content)
     resultats = []
 
@@ -142,7 +240,6 @@ def parse_buildings(gml_content):
         if tag not in ("Building", "BuildingPart"):
             continue
 
-        # Reference cadastrale
         ref = None
         for child in elem.iter():
             if child.tag.split("}")[-1] == "localId":
@@ -151,7 +248,6 @@ def parse_buildings(gml_content):
         if not ref:
             continue
 
-        # Annee de construction
         anyo = 0
         for child in elem.iter():
             cn = child.tag.split("}")[-1]
@@ -163,7 +259,6 @@ def parse_buildings(gml_content):
                 except ValueError:
                     pass
 
-        # Etages
         plantas = 0
         for child in elem.iter():
             if child.tag.split("}")[-1] in ("numberOfFloorsAboveGround", "storeysAboveGround"):
@@ -173,7 +268,6 @@ def parse_buildings(gml_content):
                 except ValueError:
                     pass
 
-        # Surface officielle
         superficie = 0.0
         for child in elem.iter():
             if child.tag.split("}")[-1] in ("officialArea", "value"):
@@ -185,14 +279,12 @@ def parse_buildings(gml_content):
                 except ValueError:
                     pass
 
-        # Usage
         usage = ""
         for child in elem.iter():
             if child.tag.split("}")[-1] in ("currentUse", "usage"):
                 usage = (child.text or child.get("href", "")).lower()
                 break
 
-        # Nombre de logements (unifamiliar = 1)
         nb_logements = 0
         for child in elem.iter():
             if child.tag.split("}")[-1] == "numberOfDwellings":
@@ -202,52 +294,36 @@ def parse_buildings(gml_content):
                 except ValueError:
                     pass
 
-        # ── FILTRES ──────────────────────────────────────────────────────────
-        # Annee obligatoire
         if not (ANNEE_MIN <= anyo <= ANNEE_MAX):
             continue
-        # Etages : si nil (0) on accepte, si connu et > max on rejette
         if plantas > ETAGES_MAX:
             continue
-        # Usage resididentiel
         if usage and not any(k in usage for k in ("residential", "1_", "vivienda", "residencial")):
             continue
-        # Unifamiliar : 1 logement (ou non renseigne)
         if nb_logements > 1:
             continue
 
-        # Estimation surface : officialArea si dispo, sinon 80m2/etage
         etages_calc = max(plantas, 1)
         if superficie <= 0:
             superficie = 80.0 * etages_calc
-
-        estimation = round((superficie / etages_calc) * 1.10, 2)
-
-        # Exclure les batiments avec une surface aberrante (> 500m² = pas une maison)
-        if estimation > 550:
+        if superficie > 550:
             continue
 
         resultats.append({
             "Referencia_Catastral": ref[:14] if len(ref) >= 14 else ref,
-            "Ano": anyo,
-            "plantas": plantas,
-            "Estimation_M2_Combles": estimation,
+            "Ano":           anyo,
+            "Surface_Totale_M2": round(superficie, 1),
         })
 
     return resultats
 
-# ─── PARSE ADRESSES ───────────────────────────────────────────────────────────
+# ─── INSPIRE : PARSE ADRESSES ─────────────────────────────────────────────────
 
 def parse_addresses(gml_content):
-    """
-    Extrait les adresses depuis le GML INSPIRE espagnol.
-    localId format: {prov}.{muni}.{street_code}.{numero}.{refcat}
-    """
     root = ET.fromstring(gml_content)
     NS_GML   = "http://www.opengis.net/gml/3.2"
     NS_XLINK = "http://www.w3.org/1999/xlink"
 
-    # 1. Rues : TN.{prov}.{muni}.{code} → nom de rue
     street_names = {}
     for elem in root.iter():
         if elem.tag.split("}")[-1] == "ThoroughfareName":
@@ -258,7 +334,6 @@ def parse_addresses(gml_content):
                     street_names[code] = (child.text or "").strip().title()
                     break
 
-    # 2. Codes postaux : PD.{prov}.{muni}.{cp} → code postal
     postal = {}
     for elem in root.iter():
         if elem.tag.split("}")[-1] == "PostalDescriptor":
@@ -267,7 +342,6 @@ def parse_addresses(gml_content):
             if last.isdigit() and len(last) == 5:
                 postal[gml_id] = last
 
-    # 3. Adresses : localId → {Calle, Numero, CP}
     adresses = {}
     for elem in root.iter():
         if elem.tag.split("}")[-1] != "Address":
@@ -282,9 +356,9 @@ def parse_addresses(gml_content):
         parts = lid.split(".")
         if len(parts) < 5:
             continue
-        refcat      = parts[-1]          # ex: 0902901TM7000S
-        numero      = parts[-2]          # ex: S-N ou 5
-        street_code = parts[2]           # ex: 1
+        refcat      = parts[-1]
+        numero      = parts[-2]
+        street_code = parts[2]
         calle = street_names.get(street_code, "")
         cp    = ""
         for child in elem.iter():
@@ -315,87 +389,21 @@ def export_to_sheets(df, url, creds):
     ws.update_values(crange=f"A{debut}", values=df.fillna("").astype(str).values.tolist())
     print(f"OK {len(df)} lignes exportees (ligne {debut})")
 
-# ─── SCORING ─────────────────────────────────────────────────────────────────
-
-def calculer_scoring(superficie: float, anyo: int) -> dict:
-    """
-    Calcule les probabilites de garage/cave selon l'annee et la surface,
-    deduit ces espaces, et retourne un score 1-5 sur les combles nets.
-
-    Probabilites basees sur les patterns de construction espagnols :
-    - 1960-1975 : eres des caves (bodega), peu de garages
-    - 1976-1990 : transition, cave + garage commencent
-    - 1991-2006 : garage generalise, cave rare
-    """
-
-    # ── Probabilites garage ──────────────────────────────────────────────────
-    if superficie < 70:
-        proba_garage = 5    # Trop petit pour un garage
-    elif anyo <= 1975:
-        proba_garage = 15
-    elif anyo <= 1990:
-        proba_garage = 45
-    else:
-        proba_garage = 72
-
-    # ── Probabilites cave ────────────────────────────────────────────────────
-    if anyo <= 1975:
-        proba_cave = 68
-    elif anyo <= 1990:
-        proba_cave = 38
-    else:
-        proba_cave = 15
-
-    # ── Surface déduite (valeur esperee = proba x surface moyenne) ───────────
-    surf_garage_moy = 22  # m² moyen d'un garage en Espagne
-    surf_cave_moy   = 18  # m² moyen d'une cave/bodega
-
-    deduction = round(
-        (proba_garage / 100) * surf_garage_moy +
-        (proba_cave   / 100) * surf_cave_moy,
-        1
-    )
-
-    # ── Combles nets ─────────────────────────────────────────────────────────
-    combles_nets  = round(max(0, superficie - deduction), 1)
-
-    # ── Score 1-5 ────────────────────────────────────────────────────────────
-    if combles_nets >= 100:
-        score = 5   # Excellent — gros contrat garanti
-    elif combles_nets >= 70:
-        score = 4   # Tres bien
-    elif combles_nets >= 45:
-        score = 3   # Bien
-    elif combles_nets >= 25:
-        score = 2   # Moyen
-    else:
-        score = 1   # Faible potentiel
-
-    return {
-        "Proba_Garage_pct":   proba_garage,
-        "Proba_Cave_pct":     proba_cave,
-        "Deduction_Estimee_M2": deduction,
-        "Combles_Nets_M2":    combles_nets,
-        "Score":              score,
-    }
-
-
 # ─── TRAITEMENT D'UNE VILLE ───────────────────────────────────────────────────
 
-def traiter_ville(city: str) -> list:
-    """Telecharge et filtre les proprietes d'une ville. Retourne une liste de dicts."""
+def traiter_ville(city: str, prov_code: str = None) -> tuple:
+    """Retourne (liste de rows, province_code_trouve)."""
     print(f"\n{'─'*55}")
     print(f"  Recherche : {city}")
     print(f"{'─'*55}")
 
-    muni_name, bu_url, prov_code = find_zip_url(city, ATOM_BU)
+    muni_name, bu_url, prov_code_found = find_zip_url(city, ATOM_BU, province_code=prov_code)
     if not bu_url:
         print(f"  '{city}' introuvable — ignoree.")
-        print("  Conseil : utilisez le nom espagnol (Zamora, Sevilla, Malaga...)")
-        return []
+        return [], prov_code
 
     muni_clean = re.sub(r'^\d+-', '', muni_name).replace(' buildings', '').strip().title()
-    print(f"  Trouve : {muni_clean} (province {prov_code})")
+    print(f"  Trouve : {muni_clean} (province {prov_code_found})")
 
     print("  Batiments INSPIRE :")
     bu_content = download_gml_from_zip(bu_url)
@@ -403,24 +411,20 @@ def traiter_ville(city: str) -> list:
     print(f"  -> {len(buildings)} batiments qualifies")
 
     if not buildings:
-        return []
+        return [], prov_code_found
 
     adresses = {}
     print("  Adresses INSPIRE :")
-    _, ad_url, _ = find_zip_url(city, ATOM_AD, province_code=prov_code)
+    _, ad_url, _ = find_zip_url(city, ATOM_AD, province_code=prov_code_found)
     if ad_url:
         ad_content = download_gml_from_zip(ad_url)
         adresses   = parse_addresses(ad_content)
         print(f"  -> {len(adresses)} adresses chargees")
-    else:
-        print("  -> Adresses non disponibles")
 
     rows = []
     for b in buildings:
-        ref     = b["Referencia_Catastral"]
-        addr    = adresses.get(ref, {})
-        surf    = b["Estimation_M2_Combles"] / 1.10
-        scoring = calculer_scoring(surf, b["Ano"])
+        ref  = b["Referencia_Catastral"]
+        addr = adresses.get(ref, {})
         rows.append({
             "Referencia_Catastral":  ref,
             "Calle":                 addr.get("Calle", ""),
@@ -428,40 +432,39 @@ def traiter_ville(city: str) -> list:
             "CP":                    addr.get("CP", ""),
             "Municipio":             muni_clean,
             "Ano":                   b["Ano"],
-            "Surface_Totale_M2":     round(surf, 1),
-            "Proba_Garage_pct":      scoring["Proba_Garage_pct"],
-            "Proba_Cave_pct":        scoring["Proba_Cave_pct"],
-            "Deduction_Estimee_M2":  scoring["Deduction_Estimee_M2"],
-            "Combles_Nets_M2":       scoring["Combles_Nets_M2"],
-            "Score":                 scoring["Score"],
+            "Surface_Totale_M2":     b["Surface_Totale_M2"],
+            "Surface_Habitable_M2":  0.0,
+            "Surface_Garage_M2":     0.0,
+            "Surface_Cave_M2":       0.0,
+            "Combles_Nets_M2":       0.0,
+            "Score":                 0,
             "Statut_Appel":          "",
         })
-    return rows
-
+    return rows, prov_code_found
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 55)
-    print("  POSTESPAGNE — Telechargement Automatique")
-    print("  Cadastre INSPIRE -> Google Sheets")
+    print("  POSTESPAGNE — Cadastre Exact")
+    print("  INSPIRE + OVC API -> Combles Reels")
     print("=" * 55)
 
-    # Accepte plusieurs villes en arguments
     if len(sys.argv) > 1:
         villes = sys.argv[1:]
     else:
-        saisie = input("\nVille(s) espagnole(s) separees par virgule\n  ex: Zamora, Morales del Vino, Villaralbo\n  > ").strip()
+        saisie = input("\nVille(s) separees par virgule (ex: Zamora, Morales del Vino)\n  > ").strip()
         villes = [v.strip() for v in saisie.split(",") if v.strip()]
 
     if not villes:
         print("Erreur: aucune ville saisie.")
         sys.exit(1)
 
-    # Traiter chaque ville et fusionner
+    # ── Phase 1 : telecharger les batiments INSPIRE ───────────────────────────
     tous_rows = []
+    prov_code = None
     for city in villes:
-        rows = traiter_ville(city)
+        rows, prov_code = traiter_ville(city, prov_code)
         tous_rows.extend(rows)
         print(f"  Total cumule : {len(tous_rows)} proprietes")
 
@@ -470,12 +473,19 @@ def main():
         sys.exit(0)
 
     df = pd.DataFrame(tous_rows, columns=COLONNES_SORTIE)
+
+    # ── Phase 2 : enrichissement exact via OVC API ────────────────────────────
+    df = enrichir_exact(df)
+
+    # ── Filtrer les Score 0 (OVC absent + pas de combles estimes) ─────────────
+    df = df[df["Score"] >= 1].copy()
+
     df.sort_values("Score", ascending=False, inplace=True)
     df.reset_index(drop=True, inplace=True)
     total = len(df)
 
     print(f"\n{'='*55}")
-    print(f"  TOTAL : {total:,} proprietes qualifiees")
+    print(f"  TOTAL : {total:,} proprietes")
     print(f"  Villes : {', '.join(villes)}")
     print(f"{'='*55}")
     print("\nApercu des 3 meilleures :")
@@ -487,7 +497,10 @@ def main():
         bar = "█" * min(n * 30 // max(total, 1), 30)
         print(f"  Score {s} : {n:>5}  {bar}")
 
-    # Combien exporter
+    sans_combles = (df["Combles_Nets_M2"] == 0).sum()
+    print(f"\n  Toit plat / sans combles detectes : {sans_combles:,} proprietes")
+
+    # ── Export ────────────────────────────────────────────────────────────────
     print(f"\nCombien exporter ? (max {total:,} — Entree = tout)")
     choix = input("  Nombre : ").strip()
     if choix:
@@ -496,44 +509,14 @@ def main():
         except ValueError:
             pass
 
-    # Export CSV
     nom = "_".join(v.lower().replace(" ", "-") for v in villes[:3])
-    csv_out = f"{nom}_cadastre.csv"
+    csv_out = f"{nom}_exact.csv"
     df.to_csv(csv_out, index=False)
     print(f"\nCSV cree : {csv_out}")
-    print("-> Importe dans Google Sheets : Fichier > Importer")
 
-    # Google Sheets optionnel
     creds_file = CREDENTIALS or "credentials.json"
     if os.path.isfile(creds_file):
         sheet_input = SHEET_URL or input("\nURL Google Sheet (Entree pour ignorer) : ").strip()
-        if sheet_input:
-            export_to_sheets(df, sheet_input, creds_file)
-
-    print("\nTermine.")
-    choix = input("  Nombre : ").strip()
-
-    if choix:
-        try:
-            n = int(choix)
-            n = max(1, min(n, total))
-            df = df.head(n)
-            print(f"-> Export limite a {n:,} proprietes")
-        except ValueError:
-            print("-> Valeur invalide, export de toutes les proprietes")
-    else:
-        print(f"-> Export de toutes les {total:,} proprietes")
-
-    # 6. Export CSV (toujours) + Google Sheets (si credentials dispo)
-    csv_out = city.lower().replace(" ", "_") + "_cadastre.csv"
-    df.to_csv(csv_out, index=False)
-    print(f"\nFichier CSV cree : {csv_out}")
-    print("-> Glisse ce fichier dans Google Sheets (Fichier > Importer)")
-
-    # Google Sheets optionnel
-    creds_file = CREDENTIALS or "credentials.json"
-    if os.path.isfile(creds_file):
-        sheet_input = SHEET_URL or input("\nURL Google Sheet (ou Entree pour ignorer) : ").strip()
         if sheet_input:
             export_to_sheets(df, sheet_input, creds_file)
 
