@@ -284,7 +284,7 @@ def traiter_ville(city, prov_code=None):
         print(f"  '{city}' introuvable.")
         return [], prov_code
 
-    muni = re.sub(r'^\d+-','', muni_name).replace(' buildings','').strip().title()
+    muni = re.sub(r'^\d+-','', muni_name.strip()).replace(' buildings','').strip().title()
     prov_nom = PROV_NOM.get(prov, prov or "")
     print(f"  -> {muni} | Province : {prov_nom}")
 
