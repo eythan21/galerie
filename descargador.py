@@ -314,11 +314,31 @@ def main():
         })
 
     df = pd.DataFrame(rows, columns=COLONNES_SORTIE)
-    print(f"\n{len(df):,} proprietes qualifiees a {muni_name}")
-    print("\nApercu :")
+    total = len(df)
+
+    print(f"\n{'='*55}")
+    print(f"  {total:,} proprietes qualifiees trouvees a {muni_name}")
+    print(f"{'='*55}")
+    print("\nApercu des 3 premieres :")
     print(df.head(3).to_string(index=False))
 
-    # 5. Export
+    # 5. Choisir combien en exporter
+    print(f"\nCombien voulez-vous exporter ? (max {total:,})")
+    print(f"  Appuyez sur Entree pour tout exporter ({total:,})")
+    choix = input("  Nombre : ").strip()
+
+    if choix:
+        try:
+            n = int(choix)
+            n = max(1, min(n, total))
+            df = df.head(n)
+            print(f"-> Export limite a {n:,} proprietes")
+        except ValueError:
+            print("-> Valeur invalide, export de toutes les proprietes")
+    else:
+        print(f"-> Export de toutes les {total:,} proprietes")
+
+    # 6. Export
     sheet_input = SHEET_URL or input("\nURL Google Sheet : ").strip()
     creds_file  = CREDENTIALS or input("credentials.json : ").strip() or "credentials.json"
 
