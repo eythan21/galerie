@@ -1,85 +1,94 @@
 #!/usr/bin/env python3
 """
-postespagne.py — Cadastre Espagnol → Google Sheets
-Qualification Isolation 1€ : Maisons individuelles (Vivienda Unifamiliar)
+postespagne.py — Cadastre Espagnol (.CAT) → Google Sheets
+Qualification Isolation 1€: Maisons individuelles (Vivienda Unifamiliar)
+Calcul exact des combles via les codes usage garage/cave du fichier CAT.
 
 Usage:
-    python postespagne.py
-    python postespagne.py mon_fichier.CAT
+    python3 postespagne.py
+    python3 postespagne.py mon_fichier.CAT
 """
 
-import sys
-import os
-import re
+import sys, os, re
 import pandas as pd
 import pygsheets
 from tqdm import tqdm
 
-# ─── CONFIGURATION ───────────────────────────────────────────────────────────
+# ─── CONFIGURATION RAPIDE ────────────────────────────────────────────────────
+SHEET_URL   = ""   # ex: "https://docs.google.com/spreadsheets/d/XXXX..."
+CREDENTIALS = ""   # ex: "credentials.json"
+
 ANNEE_MIN, ANNEE_MAX = 1960, 2006
-ETAGES_MAX = 2          # Bajo + 1 étage = 2 au maximum
-CHUNK_SIZE = 50_000     # Lignes chargées en mémoire par lot
+ETAGES_MAX = 2
 
 COLONNES_SORTIE = [
-    "Referencia_Catastral",
-    "Calle",
-    "Numero",
-    "CP",
-    "Municipio",
-    "Año",
-    "Estimation_M2_Combles",
-    "Statut_Appel",
+    "Referencia_Catastral", "Calle", "Numero", "CP", "Municipio", "Ano",
+    "Surface_Totale_M2", "Surface_Habitable_M2", "Surface_Garage_M2",
+    "Surface_Cave_M2", "Combles_Nets_M2", "Score", "Statut_Appel",
 ]
 
 # ─── FORMAT FIXE DU FICHIER .CAT ─────────────────────────────────────────────
-# Format SIDPA — Sede Electrónica del Catastro (positions 0-indexed)
-# ⚠️  Si vos valeurs semblent décalées, ajustez les slices ci-dessous
-#     en ouvrant le .CAT dans un éditeur et en comptant les colonnes.
+# Format SIDPA — Sede Electronica del Catastro (positions 0-indexed)
 
-# Tipo 11 — FINCA (adresse postale du bien)
+# Tipo 11 — FINCA (adresse postale)
 T11 = {
-    "ref_catastral": slice(9, 23),    # Référence cadastrale (14 chars)
-    "nombre_via":    slice(100, 150), # Nom de la rue
-    "numero":        slice(150, 154), # Numéro de rue
-    "cod_postal":    slice(162, 167), # Code postal (5 chiffres)
-    "municipio":     slice(167, 207), # Nom de la commune
+    "ref_catastral": slice(9, 23),
+    "nombre_via":    slice(100, 150),
+    "numero":        slice(150, 154),
+    "cod_postal":    slice(162, 167),
+    "municipio":     slice(167, 207),
 }
 
-# Tipo 13 — LOCAL / BIEN INMUEBLE (caractéristiques du bien)
+# Tipo 13 — LOCAL / BIEN INMUEBLE
 T13 = {
-    "ref_catastral":  slice(9, 23),   # Référence cadastrale
-    "naturaleza":     slice(23, 24),  # U=Urbana, R=Rústica
-    "uso":            slice(24, 26),  # 01=Residencial
-    "anyo":           slice(30, 34),  # Année de construction
-    "plantas_sobre":  slice(38, 41),  # Étages au-dessus du sol
-    "plantas_bajo":   slice(41, 44),  # Étages en sous-sol
-    "superficie":     slice(44, 51),  # Surface totale construite (m²)
-    "tipo_finca":     slice(55, 57),  # VU=Unifamiliar, VB=Bloc résidentiel…
+    "ref_catastral":  slice(9, 23),
+    "naturaleza":     slice(23, 24),   # U=Urbana
+    "uso":            slice(24, 26),   # 01=Residencial
+    "anyo":           slice(30, 34),
+    "plantas_sobre":  slice(38, 41),
+    "superficie":     slice(44, 51),   # Surface totale construite m²
+    "tipo_finca":     slice(55, 57),   # VU=Unifamiliar
 }
 
-# Codes acceptés pour usage résidentiel et type unifamiliar
-# (varient selon la version du fichier CAT — complétez si besoin)
-USAGE_RESIDENCIAL  = {"01", "1", "R"}
-TIPO_UNIFAMILIAR   = {"VU", "U", "V1", "UF", "1U"}
+# Tipo 15 — CONSTRUCCION (detail de chaque espace dans le bien)
+# ⚠️  Ajustez si vos valeurs semblent incorrectes
+T15 = {
+    "ref_catastral": slice(9, 23),
+    "calificacion":  slice(43, 45),   # Code usage: VV, GA, TR, AL...
+    "superficie":    slice(45, 52),   # Surface de cet espace en m²
+}
+
+# Codes usage par categorie (plusieurs variantes selon version du fichier)
+USOS_HABITABLE = {"VV", "VI", "VT", "VP", "01", "1", "VIV"}
+USOS_GARAGE    = {"GA", "GAR", "03", "3", "GR"}
+USOS_CAVE      = {"TR", "TRS", "ALM", "AL", "DE", "08", "8", "TRO"}
+
+USAGE_RESIDENCIAL = {"01", "1", "R"}
+TIPO_UNIFAMILIAR  = {"VU", "U", "V1", "UF", "1U"}
+
+# ─── SCORING ─────────────────────────────────────────────────────────────────
+
+def calculer_score(combles_nets: float) -> int:
+    """Score 1-5 base sur la surface combles nette reelle."""
+    if combles_nets >= 100: return 5   # Excellent — gros contrat
+    if combles_nets >= 70:  return 4   # Tres bien
+    if combles_nets >= 45:  return 3   # Bien
+    if combles_nets >= 25:  return 2   # Moyen
+    return 1                           # Faible potentiel
 
 # ─── PARSING ─────────────────────────────────────────────────────────────────
 
-def _compter_lignes(filepath: str) -> int:
-    with open(filepath, "r", encoding="latin-1", errors="replace") as f:
-        return sum(1 for _ in f)
-
-
 def parse_cat_file(filepath: str) -> pd.DataFrame:
-    """
-    Lit le fichier .CAT ligne par ligne et retourne un DataFrame
-    contenant uniquement les biens qualifiés (filtres isolation 1€).
-    """
-    print(f"\nComptage des lignes du fichier…")
-    total = _compter_lignes(filepath)
-    print(f"→ {total:,} lignes détectées.")
+    print("\nComptage des lignes...")
+    with open(filepath, "r", encoding="latin-1", errors="replace") as f:
+        total = sum(1 for _ in f)
+    print(f"-> {total:,} lignes detectees.")
 
-    adresses: dict[str, dict] = {}   # ref_catastral → adresse (Tipo 11)
-    resultats: list[dict]    = []    # biens qualifiés (Tipo 13)
+    adresses:  dict = {}   # ref → {Calle, Numero, CP, Municipio}
+    biens:     dict = {}   # ref → {anyo, superficie, ...}  (Tipo 13)
+    surf_hab:  dict = {}   # ref → surface habitable (Tipo 15 VV)
+    surf_gar:  dict = {}   # ref → surface garage    (Tipo 15 GA)
+    surf_cave: dict = {}   # ref → surface cave      (Tipo 15 TR)
 
     with open(filepath, "r", encoding="latin-1", errors="replace") as fh:
         for line in tqdm(fh, total=total, desc="Extraction", unit="lig"):
@@ -87,7 +96,7 @@ def parse_cat_file(filepath: str) -> pd.DataFrame:
                 continue
             tipo = line[:2]
 
-            # ── Enregistrement adresse ────────────────────────────────────
+            # ── Adresse (Tipo 11) ─────────────────────────────────────────
             if tipo == "11":
                 ref = line[T11["ref_catastral"]].strip()
                 if ref:
@@ -98,179 +107,161 @@ def parse_cat_file(filepath: str) -> pd.DataFrame:
                         "Municipio": line[T11["municipio"]].strip().title(),
                     }
 
-            # ── Enregistrement bien immobilier ────────────────────────────
+            # ── Bien immobilier (Tipo 13) ─────────────────────────────────
             elif tipo == "13":
                 if len(line) < 60:
                     continue
-
-                # Filtre 1 — Urbano
-                naturaleza = line[T13["naturaleza"]].strip().upper()
-                if naturaleza != "U":
+                if line[T13["naturaleza"]].strip().upper() != "U":
                     continue
-
-                # Filtre 2 — Usage résidentiel
-                uso = line[T13["uso"]].strip()
-                if uso not in USAGE_RESIDENCIAL:
+                if line[T13["uso"]].strip() not in USAGE_RESIDENCIAL:
                     continue
-
-                # Filtre 3 — Vivienda Unifamiliar
-                tipo_finca = line[T13["tipo_finca"]].strip().upper()
-                if tipo_finca not in TIPO_UNIFAMILIAR:
+                if line[T13["tipo_finca"]].strip().upper() not in TIPO_UNIFAMILIAR:
                     continue
-
-                # Parsing numérique
                 try:
-                    anyo       = int(line[T13["anyo"]].strip()         or 0)
+                    anyo       = int(line[T13["anyo"]].strip()        or 0)
                     plantas    = int(line[T13["plantas_sobre"]].strip() or 0)
-                    superficie = float(line[T13["superficie"]].strip()  or 0)
+                    superficie = float(line[T13["superficie"]].strip() or 0)
                 except ValueError:
                     continue
-
-                # Filtre 4 — Année 1960-2006
-                if not (ANNEE_MIN <= anyo <= ANNEE_MAX):
-                    continue
-
-                # Filtre 5 — Maximum 2 étages
-                if plantas > ETAGES_MAX:
-                    continue
-
-                # Données incohérentes
-                if superficie <= 0:
-                    continue
-
+                if not (ANNEE_MIN <= anyo <= ANNEE_MAX): continue
+                if plantas > ETAGES_MAX:                 continue
+                if superficie <= 0:                      continue
                 ref = line[T13["ref_catastral"]].strip()
-                estimation = round((superficie / max(plantas, 1)) * 1.10, 2)
+                biens[ref] = {"anyo": anyo, "superficie": superficie}
 
-                resultats.append({
-                    "Referencia_Catastral": ref,
-                    "Año":                  anyo,
-                    "Estimation_M2_Combles": estimation,
-                    "Statut_Appel":          "",
-                    "_ref":                 ref,
-                })
+            # ── Detail construction (Tipo 15) — garage, cave, habitable ───
+            elif tipo == "15":
+                if len(line) < 52:
+                    continue
+                ref   = line[T15["ref_catastral"]].strip()
+                calif = line[T15["calificacion"]].strip().upper()
+                try:
+                    surf = float(line[T15["superficie"]].strip() or 0)
+                except ValueError:
+                    continue
+                if surf <= 0 or not ref:
+                    continue
 
-    if not resultats:
-        print("\nAucune propriété qualifiée trouvée avec les filtres actuels.")
+                if calif in USOS_HABITABLE:
+                    surf_hab[ref]  = surf_hab.get(ref, 0)  + surf
+                elif calif in USOS_GARAGE:
+                    surf_gar[ref]  = surf_gar.get(ref, 0)  + surf
+                elif calif in USOS_CAVE:
+                    surf_cave[ref] = surf_cave.get(ref, 0) + surf
+
+    if not biens:
+        print("\nAucune propriete qualifiee trouvee.")
         return pd.DataFrame(columns=COLONNES_SORTIE)
 
-    df = pd.DataFrame(resultats)
+    # ── Construire le DataFrame ───────────────────────────────────────────────
+    rows = []
+    for ref, b in biens.items():
+        surf_totale  = b["superficie"]
+        s_hab  = round(surf_hab.get(ref, 0),  1)
+        s_gar  = round(surf_gar.get(ref, 0),  1)
+        s_cave = round(surf_cave.get(ref, 0), 1)
 
-    # Jointure avec les adresses (Tipo 11)
-    for col in ("Calle", "Numero", "CP", "Municipio"):
-        df[col] = df["_ref"].map(lambda r, c=col: adresses.get(r, {}).get(c, ""))
+        # Combles nets = total - habitable - garage - cave
+        combles = round(max(0, surf_totale - s_hab - s_gar - s_cave), 1)
 
-    df.drop(columns=["_ref"], inplace=True)
-    return df[COLONNES_SORTIE]
+        # Si Tipo 15 absent pour ce bien → estimation classique
+        if s_hab == 0 and s_gar == 0 and s_cave == 0:
+            combles = round(surf_totale * 0.20, 1)   # 20% de la surface totale
 
+        addr = adresses.get(ref, {})
+        rows.append({
+            "Referencia_Catastral":  ref,
+            "Calle":                 addr.get("Calle", ""),
+            "Numero":                addr.get("Numero", ""),
+            "CP":                    addr.get("CP", ""),
+            "Municipio":             addr.get("Municipio", ""),
+            "Ano":                   b["anyo"],
+            "Surface_Totale_M2":     round(surf_totale, 1),
+            "Surface_Habitable_M2":  s_hab,
+            "Surface_Garage_M2":     s_gar,
+            "Surface_Cave_M2":       s_cave,
+            "Combles_Nets_M2":       combles,
+            "Score":                 calculer_score(combles),
+            "Statut_Appel":          "",
+        })
+
+    df = pd.DataFrame(rows, columns=COLONNES_SORTIE)
+
+    # Trier par Score decroissant (les meilleurs en premier)
+    df.sort_values("Score", ascending=False, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    return df
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
-def _extraire_sheet_id(url_ou_id: str) -> str:
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url_ou_id)
-    return m.group(1) if m else url_ou_id.strip()
-
-
-def export_to_sheets(df: pd.DataFrame, url_ou_id: str, credentials_file: str) -> None:
-    """Exporte df vers Google Sheets en mode Append (sans écraser l'existant)."""
-
-    print("\nConnexion à Google Sheets…")
-    gc       = pygsheets.authorize(service_file=credentials_file)
-    sheet_id = _extraire_sheet_id(url_ou_id)
-    sh       = gc.open_by_key(sheet_id)
-    ws       = sh.sheet1
-
+def export_to_sheets(df: pd.DataFrame, url: str, creds: str) -> None:
+    print("\nConnexion a Google Sheets...")
+    gc = pygsheets.authorize(service_file=creds)
+    sid = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    sh = gc.open_by_key(sid.group(1) if sid else url)
+    ws = sh.sheet1
     existantes = ws.get_all_values(include_tailing_empty=False)
-
     if not existantes or existantes == [[]]:
-        # Feuille vide → écrire l'en-tête en ligne 1
         ws.update_row(1, COLONNES_SORTIE)
         debut = 2
     else:
-        # Trouver la première ligne vraiment vide après les données
         debut = len(existantes) + 1
+    ws.update_values(crange=f"A{debut}", values=df.fillna("").astype(str).values.tolist())
+    print(f"OK {len(df)} lignes exportees (ligne {debut})")
 
-    if df.empty:
-        print("Aucune donnée à exporter.")
-        return
-
-    rows = df.fillna("").astype(str).values.tolist()
-    ws.update_values(crange=f"A{debut}", values=rows)
-    print(f"✓ {len(rows)} propriétés exportées (à partir de la ligne {debut}).")
-
-
-# ─── AIDE GOOGLE SHEETS ──────────────────────────────────────────────────────
-
-def afficher_aide_credentials() -> None:
-    print("""
-╔══════════════════════════════════════════════════════════════════╗
-║   COMMENT AUTORISER L'ÉCRITURE DANS VOTRE GOOGLE SHEET          ║
-╠══════════════════════════════════════════════════════════════════╣
-║  1. Allez sur https://console.cloud.google.com                   ║
-║  2. Créez un projet (ou sélectionnez-en un existant)             ║
-║  3. APIs & Services → Bibliothèque → activez :                   ║
-║       • Google Sheets API                                        ║
-║       • Google Drive API                                         ║
-║  4. APIs & Services → Identifiants → Créer des identifiants      ║
-║     → Compte de service → téléchargez le fichier JSON           ║
-║     → Renommez-le credentials.json                               ║
-║  5. Copiez l'adresse email du compte de service                  ║
-║     (ex: mon-bot@mon-projet.iam.gserviceaccount.com)             ║
-║  6. Ouvrez votre Google Sheet → Partager → collez l'email        ║
-║     → Donner le rôle Éditeur → Envoyer                          ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
-
-
-# ─── CONFIGURATION RAPIDE ────────────────────────────────────────────────────
-# Collez directement vos valeurs ici pour ne plus avoir à les saisir à chaque fois.
-# Laissez "" pour que le script vous les demande au lancement.
-
-SHEET_URL      = ""   # ex: "https://docs.google.com/spreadsheets/d/XXXX..."
-CREDENTIALS    = ""   # ex: "credentials.json"  ou chemin absolu
-
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print("=" * 60)
-    print("  POSTESPAGNE — Cadastre ES → Google Sheets")
-    print("  Qualification Isolation 1€ (Vivienda Unifamiliar)")
+    print("  POSTESPAGNE — Cadastre .CAT -> Google Sheets")
+    print("  Qualification Isolation 1€(Vivienda Unifamiliar)")
     print("=" * 60)
 
-    # 1. Fichier CAT
-    if len(sys.argv) > 1:
-        cat_file = sys.argv[1]
-    else:
-        cat_file = input("\nChemin vers le fichier .CAT : ").strip().strip('"')
-
+    cat_file = sys.argv[1] if len(sys.argv) > 1 else input("\nChemin vers le fichier .CAT : ").strip().strip('"')
     if not os.path.isfile(cat_file):
-        print(f"\nErreur : fichier introuvable → {cat_file}")
+        print(f"Erreur : fichier introuvable -> {cat_file}")
         sys.exit(1)
 
-    # 2. Google Sheet (URL ou ID)
-    sheet_input = SHEET_URL or input("URL ou ID de votre Google Sheet : ").strip()
-    if not sheet_input:
-        print("Erreur : URL/ID du Sheet manquant.")
-        sys.exit(1)
-
-    # 3. Fichier credentials
-    creds_file = CREDENTIALS or input("Chemin vers credentials.json [credentials.json] : ").strip() or "credentials.json"
-
-    if not os.path.isfile(creds_file):
-        print(f"\nFichier credentials.json introuvable → {creds_file}")
-        afficher_aide_credentials()
-        sys.exit(1)
-
-    # 4. Extraction
     df = parse_cat_file(cat_file)
-    print(f"\n{len(df):,} propriétés qualifiées trouvées.")
+    total = len(df)
+    print(f"\n{total:,} proprietes qualifiees.")
 
-    if not df.empty:
-        print("\nAperçu des 3 premières lignes :")
-        print(df.head(3).to_string(index=False))
-        export_to_sheets(df, sheet_input, creds_file)
+    if df.empty:
+        sys.exit(0)
 
-    print("\nTerminé.")
+    print("\nApercu (triees par Score) :")
+    print(df.head(5).to_string(index=False))
+
+    # Repartition des scores
+    print("\nRepartition :")
+    for s in range(5, 0, -1):
+        n = (df["Score"] == s).sum()
+        bar = "█" * (n * 20 // max(total, 1))
+        print(f"  Score {s} : {n:>5} proprietes  {bar}")
+
+    # Combien exporter
+    print(f"\nCombien exporter ? (max {total:,} — Entree = tout)")
+    choix = input("  Nombre : ").strip()
+    if choix:
+        try:
+            df = df.head(max(1, min(int(choix), total)))
+        except ValueError:
+            pass
+
+    # Export CSV
+    csv_out = os.path.splitext(os.path.basename(cat_file))[0] + "_qualifies.csv"
+    df.to_csv(csv_out, index=False)
+    print(f"\nCSV cree : {csv_out}")
+
+    # Export Google Sheets (optionnel)
+    creds_file = CREDENTIALS or "credentials.json"
+    if os.path.isfile(creds_file):
+        sheet_input = SHEET_URL or input("URL Google Sheet (Entree pour ignorer) : ").strip()
+        if sheet_input:
+            export_to_sheets(df, sheet_input, creds_file)
+
+    print("\nTermine.")
 
 
 if __name__ == "__main__":
