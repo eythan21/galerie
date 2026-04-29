@@ -17,6 +17,20 @@ from tqdm import tqdm
 ANNEE_MIN, ANNEE_MAX = 1960, 2006
 ETAGES_MAX = 2
 
+# Raccourcis province par ville connue (evite de scanner les 56 provinces)
+VILLE_PROVINCE = {
+    "ZAMORA":             "49", "MORALES DEL VINO":   "49",
+    "VILLARALBO":         "49", "ARCENILLAS":         "49",
+    "PELEAS DE ABAJO":    "49", "BENAVENTE":          "49",
+    "SALAMANCA":          "37", "VALLADOLID":         "47",
+    "BURGOS":             "09", "LEON":               "24",
+    "AVILA":              "05", "PALENCIA":           "34",
+    "SEGOVIA":            "40", "SORIA":              "42",
+    "MADRID":             "28", "BARCELONA":          "08",
+    "SEVILLA":            "41", "MALAGA":             "29",
+    "VALENCIA":           "46", "ZARAGOZA":           "50",
+}
+
 ATOM_BU = "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
 ATOM_AD = "https://www.catastro.hacienda.gob.es/INSPIRE/addresses/ES.SDGC.AD.atom.xml"
 NS_A    = "http://www.w3.org/2005/Atom"
@@ -57,9 +71,16 @@ def get_entries(url):
 
 def find_zip(city, atom_url, prov_code=None):
     city_up = city.strip().upper()
+
+    # Utiliser le raccourci province si connu
+    if not prov_code:
+        prov_code = VILLE_PROVINCE.get(city_up)
+
     entries = get_entries(atom_url)
 
+    # Chercher directement dans la province connue
     if prov_code:
+        print(f"  Recherche dans province {prov_code}...", end=" ", flush=True)
         for e in entries:
             for href, _ in e["links"]:
                 if f"/{prov_code}/" in href and href.endswith(".xml"):
@@ -68,30 +89,28 @@ def find_zip(city, atom_url, prov_code=None):
                             if city_up in se["title"].upper():
                                 for sh, st in se["links"]:
                                     if sh.endswith(".zip") or st == "application/zip":
+                                        print("OK")
                                         return se["title"], sh, prov_code
                     except Exception:
                         pass
+        print("introuvable, scan global...")
 
-    for e in entries:
-        if city_up in e["title"].upper():
-            for href, typ in e["links"]:
-                if href.endswith(".zip") or typ == "application/zip":
-                    return e["title"], href, None
+    # Scan de toutes les provinces avec barre de progression
+    prov_feeds = [(e, href) for e in entries
+                  for href, _ in e["links"] if href.endswith(".xml")]
 
-    for e in entries:
-        for href, _ in e["links"]:
-            if href.endswith(".xml"):
-                pcode = None
-                m = re.search(r"/(\d{2})/", href)
-                if m: pcode = m.group(1)
-                try:
-                    for se in tqdm(get_entries(href), desc="Recherche", unit="prov", leave=False):
-                        if city_up in se["title"].upper():
-                            for sh, st in se["links"]:
-                                if sh.endswith(".zip") or st == "application/zip":
-                                    return se["title"], sh, pcode
-                except Exception:
-                    continue
+    for _, href in tqdm(prov_feeds, desc="Scan provinces", unit="prov"):
+        pcode = None
+        m = re.search(r"/(\d{2})/", href)
+        if m: pcode = m.group(1)
+        try:
+            for se in get_entries(href):
+                if city_up in se["title"].upper():
+                    for sh, st in se["links"]:
+                        if sh.endswith(".zip") or st == "application/zip":
+                            return se["title"], sh, pcode
+        except Exception:
+            continue
     return None, None, None
 
 
