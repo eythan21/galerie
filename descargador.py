@@ -51,24 +51,41 @@ def get_entries(url):
     return entries
 
 
-def find_zip_url(city_name, atom_url):
+def find_zip_url(city_name, atom_url, province_code=None):
     """
     Parcourt le flux ATOM national puis les flux provinciaux
     pour trouver l'URL du ZIP de la ville demandee.
+    Si province_code est fourni, va directement au bon feed (beaucoup plus rapide).
+    Retourne (muni_name, zip_url, province_code_trouve).
     """
     city_up = city_name.strip().upper()
 
     # Niveau 1 : flux national
     entries = get_entries(atom_url)
 
+    # Si on connait deja le code province, aller directement
+    if province_code:
+        for e in entries:
+            for href, typ, _ in e["links"]:
+                if f"/{province_code}/" in href and (href.endswith(".xml") or "atom" in href.lower()):
+                    try:
+                        sub = get_entries(href)
+                        for se in sub:
+                            if city_up in se["title"].upper():
+                                for sh, st, _ in se["links"]:
+                                    if sh.endswith(".zip") or st == "application/zip":
+                                        return se["title"], sh, province_code
+                    except Exception:
+                        pass
+
     # Chercher directement au niveau national
     for e in entries:
         if city_up in e["title"].upper():
             for href, typ, _ in e["links"]:
                 if href.endswith(".zip") or typ == "application/zip":
-                    return e["title"], href
+                    return e["title"], href, None
 
-    # Niveau 2 : flux provinciaux
+    # Niveau 2 : flux provinciaux (avec extraction du code province)
     province_feeds = []
     for e in entries:
         for href, typ, _ in e["links"]:
@@ -76,17 +93,22 @@ def find_zip_url(city_name, atom_url):
                 province_feeds.append(href)
 
     for pf_url in tqdm(province_feeds, desc="Recherche dans les provinces", unit="prov"):
+        # Extraire le code province depuis l'URL (ex: .../buildings/49/ES...)
+        pcode = None
+        m = re.search(r"/(\d{2})/", pf_url)
+        if m:
+            pcode = m.group(1)
         try:
             sub = get_entries(pf_url)
             for e in sub:
                 if city_up in e["title"].upper():
                     for href, typ, _ in e["links"]:
                         if href.endswith(".zip") or typ == "application/zip":
-                            return e["title"], href
+                            return e["title"], href, pcode
         except Exception:
             continue
 
-    return None, None
+    return None, None, None
 
 # ─── TELECHARGEMENT ───────────────────────────────────────────────────────────
 
@@ -273,14 +295,14 @@ def main():
         print("Erreur: nom de ville manquant.")
         sys.exit(1)
 
-    # 1. Trouver l'URL buildings
+    # 1. Trouver l'URL buildings (+ code province pour accelerer la recherche adresses)
     print(f"\nRecherche de '{city}' dans le cadastre...")
-    muni_name, bu_url = find_zip_url(city, ATOM_BU)
+    muni_name, bu_url, prov_code = find_zip_url(city, ATOM_BU)
     if not bu_url:
         print(f"\nVille '{city}' introuvable.")
         print("Conseil : utilisez le nom espagnol (ex: Malaga, Valencia, Sevilla, Alicante)")
         sys.exit(1)
-    print(f"Trouve : {muni_name}")
+    print(f"Trouve : {muni_name} (province {prov_code})")
 
     # 2. Batiments
     print("\nBatiments INSPIRE :")
@@ -292,10 +314,10 @@ def main():
         print("Aucun batiment ne correspond aux filtres pour cette ville.")
         sys.exit(0)
 
-    # 3. Adresses
+    # 3. Adresses (direct si code province connu → quelques secondes au lieu de 7 min)
     adresses = {}
     print("\nAdresses INSPIRE :")
-    _, ad_url = find_zip_url(city, ATOM_AD)
+    _, ad_url, _ = find_zip_url(city, ATOM_AD, province_code=prov_code)
     if ad_url:
         ad_content = download_gml_from_zip(ad_url)
         adresses = parse_addresses(ad_content)
