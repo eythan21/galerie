@@ -19,7 +19,8 @@ CREDENTIALS = ""
 
 ANNEE_MIN, ANNEE_MAX = 1960, 2006
 ETAGES_MAX  = 2
-OVC_WORKERS = 8   # Requetes paralleles vers l'API Catastro
+OVC_WORKERS = 2   # Requetes paralleles vers l'API Catastro (limite quota)
+OVC_DELAY   = 0.4 # Secondes entre requetes pour eviter le rate-limit
 
 COLONNES_SORTIE = [
     "Referencia_Catastral", "Calle", "Numero", "CP", "Municipio", "Ano",
@@ -54,14 +55,24 @@ def calculer_score(combles: float) -> int:
 
 # ─── OVC ENRICHISSEMENT EXACT ─────────────────────────────────────────────────
 
+_rate_limited = False  # flag global pour stopper si quota depasse
+
 def get_exact_ovc(ref: str) -> dict:
     """Interroge l'API OVC pour obtenir les surfaces exactes d'une propriete."""
+    global _rate_limited
+    if _rate_limited:
+        return {}
+    time.sleep(OVC_DELAY)
     try:
         r = SESSION.get(OVC_URL, params={"RefCatastral": ref}, timeout=15)
+        if r.status_code == 403 or "superado el limite" in r.text:
+            _rate_limited = True
+            return {}
         if r.status_code != 200:
             return {}
         root = ET.fromstring(r.content)
         surf_hab = surf_gar = surf_cave = 0.0
+        # Essayer lcd/scd (format standard)
         for elem in root.iter():
             if elem.tag.split("}")[-1] != "cons":
                 continue
@@ -86,6 +97,7 @@ def get_exact_ovc(ref: str) -> dict:
             "surf_hab":  round(surf_hab, 1),
             "surf_gar":  round(surf_gar, 1),
             "surf_cave": round(surf_cave, 1),
+            "_raw_xml":  r.text if (surf_hab == 0 and surf_gar == 0 and surf_cave == 0) else "",
         }
     except Exception:
         return {}
@@ -100,9 +112,11 @@ def enrichir_exact(df: pd.DataFrame) -> pd.DataFrame:
     refs = df["Referencia_Catastral"].tolist()
     resultats = {}
 
-    print(f"\nEnrichissement exact via OVC ({len(refs)} proprietes, {OVC_WORKERS} connexions)...")
-    print("Cela prend ~2-4 minutes...")
+    duree_est = round(len(refs) * OVC_DELAY / OVC_WORKERS / 60, 0)
+    print(f"\nEnrichissement exact via OVC ({len(refs)} proprietes)...")
+    print(f"Duree estimee : ~{int(duree_est)} minutes (quota protege)")
 
+    _first_xml_printed = False
     with ThreadPoolExecutor(max_workers=OVC_WORKERS) as executor:
         futures = {executor.submit(get_exact_ovc, ref): ref for ref in refs}
         for future in tqdm(as_completed(futures), total=len(refs), desc="OVC API", unit="prop"):
@@ -110,12 +124,19 @@ def enrichir_exact(df: pd.DataFrame) -> pd.DataFrame:
             try:
                 data = future.result()
                 if data:
+                    # Debug : afficher le XML brut de la premiere reponse vide
+                    if not _first_xml_printed and data.get("_raw_xml"):
+                        print(f"\n[DEBUG XML premier retour vide]:\n{data['_raw_xml'][:800]}\n")
+                        _first_xml_printed = True
                     resultats[ref] = data
             except Exception:
                 pass
 
-    ok = len(resultats)
-    print(f"-> {ok}/{len(refs)} proprietes enrichies avec donnees exactes")
+    if _rate_limited:
+        print("\n⚠ Quota OVC depasse — attendez 1h et relancez.")
+        print("  Les proprietes restantes ont le score estimatif (15%).")
+    ok = sum(1 for d in resultats.values() if d.get("surf_hab", 0) + d.get("surf_gar", 0) + d.get("surf_cave", 0) > 0)
+    print(f"-> {ok}/{len(refs)} proprietes avec donnees exactes")
 
     rows = []
     for _, row in df.iterrows():
