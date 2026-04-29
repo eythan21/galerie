@@ -151,7 +151,7 @@ def refs_inspire(gml):
                     ok = False
             elif t == "numberOfDwellings":
                 try:
-                    if int(ch.text or 0) > 1: ok = False
+                    if int(ch.text or 0) > 6: ok = False  # exclut grands immeubles seulement
                 except: pass
         if not ok: continue
         if not (ANNEE_MIN <= anyo <= ANNEE_MAX): continue
