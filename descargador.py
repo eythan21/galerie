@@ -266,7 +266,9 @@ def refs_inspire(gml):
         if not (ANNEE_MIN <= anyo <= ANNEE_MAX): continue
         if plantas > ETAGES_MAX: continue
         if superficie > 550: continue
-        if ref_val:
+        # Seulement refs urbaines : les 7 premiers chars sont des chiffres
+        # ex: "0179026TL7907N" = urbain  /  "A0CA040TL6955S" = rustic → exclus
+        if ref_val and len(ref_val) >= 7 and ref_val[:7].isdigit():
             out.append(ref_val[:14])
     return out
 
