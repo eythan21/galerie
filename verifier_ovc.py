@@ -37,8 +37,10 @@ def ovc_verifier(ref, provincia, municipio):
         root = ET.fromstring(r.content)
 
         def val(tag):
-            el = root.find(f".//{tag}")
-            return (el.text or "").strip() if el is not None else ""
+            for el in root.iter():
+                if el.tag.split("}")[-1] == tag:
+                    return (el.text or "").strip()
+            return ""
 
         if val("cn").upper() != "UR": return {}
         if "residencial" not in val("luso").lower(): return {}
