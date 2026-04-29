@@ -366,16 +366,18 @@ def main():
     else:
         print(f"-> Export de toutes les {total:,} proprietes")
 
-    # 6. Export
-    sheet_input = SHEET_URL or input("\nURL Google Sheet : ").strip()
-    creds_file  = CREDENTIALS or input("credentials.json : ").strip() or "credentials.json"
+    # 6. Export CSV (toujours) + Google Sheets (si credentials dispo)
+    csv_out = city.lower().replace(" ", "_") + "_cadastre.csv"
+    df.to_csv(csv_out, index=False)
+    print(f"\nFichier CSV cree : {csv_out}")
+    print("-> Glisse ce fichier dans Google Sheets (Fichier > Importer)")
 
+    # Google Sheets optionnel
+    creds_file = CREDENTIALS or "credentials.json"
     if os.path.isfile(creds_file):
-        export_to_sheets(df, sheet_input, creds_file)
-    else:
-        csv_out = city.lower().replace(" ", "_") + "_cadastre.csv"
-        df.to_csv(csv_out, index=False)
-        print(f"\nPas de credentials -> CSV cree : {csv_out}")
+        sheet_input = SHEET_URL or input("\nURL Google Sheet (ou Entree pour ignorer) : ").strip()
+        if sheet_input:
+            export_to_sheets(df, sheet_input, creds_file)
 
     print("\nTermine.")
 
