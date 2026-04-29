@@ -20,10 +20,18 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "PostEspagne/1.0"})
 
 COLONNES_OUT = [
-    "Referencia_Catastral","Provincia","Municipio","Calle","Numero","CP","Ano",
+    "Referencia_Catastral","Provincia","Municipio","Tipo_Via","Calle","Numero",
+    "Bloque","Escalera","Planta","Puerta","CP","Direccion_Complete","Ano",
     "Surf_Total_M2","Surf_VIV_RDC_M2","Surf_VIV_1erEtage_M2",
     "Surf_Garage_M2","Surf_Cave_M2","Combles_Reels_M2","Score","Statut_Appel",
 ]
+
+TIPO_VIA = {
+    "CL":"Calle","AV":"Avenida","PZ":"Plaza","PS":"Paseo","CM":"Camino",
+    "CR":"Carretera","TR":"Travesia","RD":"Ronda","UR":"Urbanizacion",
+    "BO":"Barrio","LG":"Lugar","CT":"Cuesta","PJ":"Pasaje","GL":"Glorieta",
+    "AL":"Aldea","CJ":"Callejon","BJ":"Bajada","SU":"Subida","PQ":"Parque",
+}
 
 def ovc_verifier(ref, provincia, municipio):
     time.sleep(OVC_DELAY)
@@ -54,17 +62,20 @@ def ovc_verifier(ref, provincia, municipio):
 
         viv_rdc = viv_e1 = surf_gar = surf_cave = 0.0
         has_viv01 = False
+        bloque01 = escalera01 = ""
 
         for cons in root.iter():
             if cons.tag.split("}")[-1] != "cons":
                 continue
-            lcd = pt = pu = ""
+            lcd = pt = pu = bq = es = ""
             stl = 0.0
             for ch in cons.iter():
                 t = ch.tag.split("}")[-1]
                 if   t == "lcd": lcd = (ch.text or "").strip().upper()
                 elif t == "pt":  pt  = (ch.text or "").strip()
                 elif t == "pu":  pu  = (ch.text or "").strip()
+                elif t == "bq":  bq  = (ch.text or "").strip()
+                elif t == "es":  es  = (ch.text or "").strip()
                 elif t == "stl":
                     try: stl = float(ch.text or 0)
                     except: pass
@@ -76,6 +87,8 @@ def ovc_verifier(ref, provincia, municipio):
                     viv_e1 += stl
                     if pu == "01":
                         has_viv01 = True
+                        bloque01 = bq
+                        escalera01 = es
             elif any(g in lcd for g in ("APARCAMIENTO","GARAJE","GARAGE")):
                 surf_gar += stl
             elif any(c in lcd for c in ("ALMACEN","TRASTERO","SOPORT","BODEGA","DEPOSITO")):
@@ -84,11 +97,30 @@ def ovc_verifier(ref, provincia, municipio):
         if not has_viv01:
             return {}
 
+        tv_code = val("tv").upper()
+        tv = TIPO_VIA.get(tv_code, tv_code.title() if tv_code else "")
+        calle = val("nv").title()
+        numero = val("pnp")
+        cp = val("dp")
+        muni = val("nm").title()
+        prov_nom = val("np").title()
+
+        parts = [tv, calle]
+        if numero: parts.append(numero)
+        direccion = " ".join(p for p in parts if p)
+        if cp or muni:
+            direccion += f", {cp} {muni}".rstrip()
+
         return {
-            "calle":      val("nv").title(),
-            "numero":     val("pnp"),
-            "cp":         val("dp"),
-            "muni":       val("nm").title(),
+            "tipo_via":   tv,
+            "calle":      calle,
+            "numero":     numero,
+            "bloque":     bloque01,
+            "escalera":   escalera01,
+            "cp":         cp,
+            "muni":       muni,
+            "prov":       prov_nom,
+            "direccion":  direccion.strip(", "),
             "ano":        ano,
             "surf_total": round(surf_total, 1),
             "viv_rdc":    round(viv_rdc, 1),
@@ -143,11 +175,17 @@ def main():
 
             rows.append({
                 "Referencia_Catastral":  ref,
-                "Provincia":             provincia,
+                "Provincia":             data["prov"] or str(row.get("Provincia","")),
                 "Municipio":             data["muni"] or municipio,
+                "Tipo_Via":              data["tipo_via"],
                 "Calle":                 data["calle"],
                 "Numero":                data["numero"],
+                "Bloque":                data["bloque"],
+                "Escalera":              data["escalera"],
+                "Planta":                "01",
+                "Puerta":                "01",
                 "CP":                    data["cp"],
+                "Direccion_Complete":    data["direccion"],
                 "Ano":                   data["ano"],
                 "Surf_Total_M2":         data["surf_total"],
                 "Surf_VIV_RDC_M2":       data["viv_rdc"],
