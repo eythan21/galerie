@@ -381,58 +381,47 @@ def calculer_scoring(superficie: float, anyo: int) -> dict:
     }
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── TRAITEMENT D'UNE VILLE ───────────────────────────────────────────────────
 
-def main():
-    print("=" * 55)
-    print("  POSTESPAGNE — Telechargement Automatique")
-    print("  Cadastre INSPIRE -> Google Sheets")
-    print("=" * 55)
+def traiter_ville(city: str) -> list:
+    """Telecharge et filtre les proprietes d'une ville. Retourne une liste de dicts."""
+    print(f"\n{'─'*55}")
+    print(f"  Recherche : {city}")
+    print(f"{'─'*55}")
 
-    city = sys.argv[1] if len(sys.argv) > 1 else input("\nVille espagnole (ex: Malaga) : ").strip()
-    if not city:
-        print("Erreur: nom de ville manquant.")
-        sys.exit(1)
-
-    # 1. Trouver l'URL buildings (+ code province pour accelerer la recherche adresses)
-    print(f"\nRecherche de '{city}' dans le cadastre...")
     muni_name, bu_url, prov_code = find_zip_url(city, ATOM_BU)
     if not bu_url:
-        print(f"\nVille '{city}' introuvable.")
-        print("Conseil : utilisez le nom espagnol (ex: Malaga, Valencia, Sevilla, Alicante)")
-        sys.exit(1)
-    # Nettoyer le nom : "49900-ZAMORA buildings" -> "ZAMORA"
-    muni_clean = re.sub(r'^\d+-', '', muni_name).replace(' buildings', '').strip().title()
-    print(f"Trouve : {muni_clean} (province {prov_code})")
+        print(f"  '{city}' introuvable — ignoree.")
+        print("  Conseil : utilisez le nom espagnol (Zamora, Sevilla, Malaga...)")
+        return []
 
-    # 2. Batiments
-    print("\nBatiments INSPIRE :")
+    muni_clean = re.sub(r'^\d+-', '', muni_name).replace(' buildings', '').strip().title()
+    print(f"  Trouve : {muni_clean} (province {prov_code})")
+
+    print("  Batiments INSPIRE :")
     bu_content = download_gml_from_zip(bu_url)
-    buildings = parse_buildings(bu_content)
-    print(f"-> {len(buildings)} batiments qualifies")
+    buildings  = parse_buildings(bu_content)
+    print(f"  -> {len(buildings)} batiments qualifies")
 
     if not buildings:
-        print("Aucun batiment ne correspond aux filtres pour cette ville.")
-        sys.exit(0)
+        return []
 
-    # 3. Adresses (direct si code province connu → quelques secondes au lieu de 7 min)
     adresses = {}
-    print("\nAdresses INSPIRE :")
+    print("  Adresses INSPIRE :")
     _, ad_url, _ = find_zip_url(city, ATOM_AD, province_code=prov_code)
     if ad_url:
         ad_content = download_gml_from_zip(ad_url)
-        adresses = parse_addresses(ad_content)
-        print(f"-> {len(adresses)} adresses chargees")
+        adresses   = parse_addresses(ad_content)
+        print(f"  -> {len(adresses)} adresses chargees")
     else:
-        print("-> Adresses non disponibles pour cette ville")
+        print("  -> Adresses non disponibles")
 
-    # 4. DataFrame avec scoring
     rows = []
     for b in buildings:
-        ref      = b["Referencia_Catastral"]
-        addr     = adresses.get(ref, {})
-        surf     = b["Estimation_M2_Combles"] / 1.10  # retrouver surface originale
-        scoring  = calculer_scoring(surf, b["Ano"])
+        ref     = b["Referencia_Catastral"]
+        addr    = adresses.get(ref, {})
+        surf    = b["Estimation_M2_Combles"] / 1.10
+        scoring = calculer_scoring(surf, b["Ano"])
         rows.append({
             "Referencia_Catastral":  ref,
             "Calle":                 addr.get("Calle", ""),
@@ -448,19 +437,81 @@ def main():
             "Score":                 scoring["Score"],
             "Statut_Appel":          "",
         })
+    return rows
 
-    df = pd.DataFrame(rows, columns=COLONNES_SORTIE)
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 55)
+    print("  POSTESPAGNE — Telechargement Automatique")
+    print("  Cadastre INSPIRE -> Google Sheets")
+    print("=" * 55)
+
+    # Accepte plusieurs villes en arguments
+    if len(sys.argv) > 1:
+        villes = sys.argv[1:]
+    else:
+        saisie = input("\nVille(s) espagnole(s) separees par virgule\n  ex: Zamora, Morales del Vino, Villaralbo\n  > ").strip()
+        villes = [v.strip() for v in saisie.split(",") if v.strip()]
+
+    if not villes:
+        print("Erreur: aucune ville saisie.")
+        sys.exit(1)
+
+    # Traiter chaque ville et fusionner
+    tous_rows = []
+    for city in villes:
+        rows = traiter_ville(city)
+        tous_rows.extend(rows)
+        print(f"  Total cumule : {len(tous_rows)} proprietes")
+
+    if not tous_rows:
+        print("\nAucune propriete trouvee.")
+        sys.exit(0)
+
+    df = pd.DataFrame(tous_rows, columns=COLONNES_SORTIE)
+    df.sort_values("Score", ascending=False, inplace=True)
+    df.reset_index(drop=True, inplace=True)
     total = len(df)
 
     print(f"\n{'='*55}")
-    print(f"  {total:,} proprietes qualifiees trouvees a {muni_clean}")
+    print(f"  TOTAL : {total:,} proprietes qualifiees")
+    print(f"  Villes : {', '.join(villes)}")
     print(f"{'='*55}")
-    print("\nApercu des 3 premieres :")
+    print("\nApercu des 3 meilleures :")
     print(df.head(3).to_string(index=False))
 
-    # 5. Choisir combien en exporter
-    print(f"\nCombien voulez-vous exporter ? (max {total:,})")
-    print(f"  Appuyez sur Entree pour tout exporter ({total:,})")
+    print("\nRepartition des scores :")
+    for s in range(5, 0, -1):
+        n = (df["Score"] == s).sum()
+        bar = "█" * min(n * 30 // max(total, 1), 30)
+        print(f"  Score {s} : {n:>5}  {bar}")
+
+    # Combien exporter
+    print(f"\nCombien exporter ? (max {total:,} — Entree = tout)")
+    choix = input("  Nombre : ").strip()
+    if choix:
+        try:
+            df = df.head(max(1, min(int(choix), total)))
+        except ValueError:
+            pass
+
+    # Export CSV
+    nom = "_".join(v.lower().replace(" ", "-") for v in villes[:3])
+    csv_out = f"{nom}_cadastre.csv"
+    df.to_csv(csv_out, index=False)
+    print(f"\nCSV cree : {csv_out}")
+    print("-> Importe dans Google Sheets : Fichier > Importer")
+
+    # Google Sheets optionnel
+    creds_file = CREDENTIALS or "credentials.json"
+    if os.path.isfile(creds_file):
+        sheet_input = SHEET_URL or input("\nURL Google Sheet (Entree pour ignorer) : ").strip()
+        if sheet_input:
+            export_to_sheets(df, sheet_input, creds_file)
+
+    print("\nTermine.")
     choix = input("  Nombre : ").strip()
 
     if choix:
