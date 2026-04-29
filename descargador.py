@@ -21,8 +21,9 @@ CREDENTIALS = ""   # ex: "credentials.json"
 ANNEE_MIN, ANNEE_MAX = 1960, 2006
 ETAGES_MAX = 2
 COLONNES_SORTIE = [
-    "Referencia_Catastral", "Calle", "Numero", "CP",
-    "Municipio", "Ano", "Estimation_M2_Combles", "Statut_Appel"
+    "Referencia_Catastral", "Calle", "Numero", "CP", "Municipio", "Ano",
+    "Surface_Totale_M2", "Proba_Garage_pct", "Proba_Cave_pct",
+    "Deduction_Estimee_M2", "Combles_Nets_M2", "Score", "Statut_Appel"
 ]
 
 # ─── INSPIRE CATASTRO ─────────────────────────────────────────────────────────
@@ -314,6 +315,72 @@ def export_to_sheets(df, url, creds):
     ws.update_values(crange=f"A{debut}", values=df.fillna("").astype(str).values.tolist())
     print(f"OK {len(df)} lignes exportees (ligne {debut})")
 
+# ─── SCORING ─────────────────────────────────────────────────────────────────
+
+def calculer_scoring(superficie: float, anyo: int) -> dict:
+    """
+    Calcule les probabilites de garage/cave selon l'annee et la surface,
+    deduit ces espaces, et retourne un score 1-5 sur les combles nets.
+
+    Probabilites basees sur les patterns de construction espagnols :
+    - 1960-1975 : eres des caves (bodega), peu de garages
+    - 1976-1990 : transition, cave + garage commencent
+    - 1991-2006 : garage generalise, cave rare
+    """
+
+    # ── Probabilites garage ──────────────────────────────────────────────────
+    if superficie < 70:
+        proba_garage = 5    # Trop petit pour un garage
+    elif anyo <= 1975:
+        proba_garage = 15
+    elif anyo <= 1990:
+        proba_garage = 45
+    else:
+        proba_garage = 72
+
+    # ── Probabilites cave ────────────────────────────────────────────────────
+    if anyo <= 1975:
+        proba_cave = 68
+    elif anyo <= 1990:
+        proba_cave = 38
+    else:
+        proba_cave = 15
+
+    # ── Surface déduite (valeur esperee = proba x surface moyenne) ───────────
+    surf_garage_moy = 22  # m² moyen d'un garage en Espagne
+    surf_cave_moy   = 18  # m² moyen d'une cave/bodega
+
+    deduction = round(
+        (proba_garage / 100) * surf_garage_moy +
+        (proba_cave   / 100) * surf_cave_moy,
+        1
+    )
+
+    # ── Combles nets ─────────────────────────────────────────────────────────
+    combles_bruts = round((superficie / 1) * 1.10, 1)  # surface totale × 1.10
+    combles_nets  = round(max(0, combles_bruts - deduction), 1)
+
+    # ── Score 1-5 ────────────────────────────────────────────────────────────
+    if combles_nets >= 100:
+        score = 5   # Excellent — gros contrat garanti
+    elif combles_nets >= 70:
+        score = 4   # Tres bien
+    elif combles_nets >= 45:
+        score = 3   # Bien
+    elif combles_nets >= 25:
+        score = 2   # Moyen
+    else:
+        score = 1   # Faible potentiel
+
+    return {
+        "Proba_Garage_pct":   proba_garage,
+        "Proba_Cave_pct":     proba_cave,
+        "Deduction_Estimee_M2": deduction,
+        "Combles_Nets_M2":    combles_nets,
+        "Score":              score,
+    }
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -359,11 +426,13 @@ def main():
     else:
         print("-> Adresses non disponibles pour cette ville")
 
-    # 4. DataFrame
+    # 4. DataFrame avec scoring
     rows = []
     for b in buildings:
-        ref  = b["Referencia_Catastral"]
-        addr = adresses.get(ref, {})
+        ref      = b["Referencia_Catastral"]
+        addr     = adresses.get(ref, {})
+        surf     = b["Estimation_M2_Combles"] / 1.10  # retrouver surface originale
+        scoring  = calculer_scoring(surf, b["Ano"])
         rows.append({
             "Referencia_Catastral":  ref,
             "Calle":                 addr.get("Calle", ""),
@@ -371,7 +440,12 @@ def main():
             "CP":                    addr.get("CP", ""),
             "Municipio":             muni_clean,
             "Ano":                   b["Ano"],
-            "Estimation_M2_Combles": b["Estimation_M2_Combles"],
+            "Surface_Totale_M2":     round(surf, 1),
+            "Proba_Garage_pct":      scoring["Proba_Garage_pct"],
+            "Proba_Cave_pct":        scoring["Proba_Cave_pct"],
+            "Deduction_Estimee_M2":  scoring["Deduction_Estimee_M2"],
+            "Combles_Nets_M2":       scoring["Combles_Nets_M2"],
+            "Score":                 scoring["Score"],
             "Statut_Appel":          "",
         })
 
@@ -379,7 +453,7 @@ def main():
     total = len(df)
 
     print(f"\n{'='*55}")
-    print(f"  {total:,} proprietes qualifiees trouvees a {muni_name}")
+    print(f"  {total:,} proprietes qualifiees trouvees a {muni_clean}")
     print(f"{'='*55}")
     print("\nApercu des 3 premieres :")
     print(df.head(3).to_string(index=False))
