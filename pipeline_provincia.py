@@ -4,11 +4,12 @@ pipeline_provincia.py - Scan complet d'une province espagnole.
 
 Phase 1: INSPIRE pour toutes les communes de la province
 Phase 2: OVC verif VIVIENDA 01/01 sur tous les candidats
-Sortie : <provincia>_provincia_vivienda01.csv
+Sortie : <provincia>_provincia_vivienda01.csv  (ou nom custom)
 
 Usage:
     python3 pipeline_provincia.py Zamora
-    python3 pipeline_provincia.py 49        # par code province (2 chiffres)
+    python3 pipeline_provincia.py 49             # par code province (2 chiffres)
+    python3 pipeline_provincia.py Zamora "zamora V2"   # nom de sortie custom
 
 Reprenable : si interrompu (Ctrl+C, quota OVC, crash), relance la meme
 commande -> reprend au checkpoint le plus recent.
@@ -66,7 +67,7 @@ def resolve_province(arg: str):
     return code, PROV_NOM[code]
 
 
-def phase_inspire(prov_code: str, prov_nom: str):
+def phase_inspire(prov_code: str, prov_nom: str, output_name: str = None):
     cp = Path(f"cp_provincia_{prov_code}_inspire.json")
     state = json.loads(cp.read_text()) if cp.exists() else {"done": [], "rows": []}
     done = set(state["done"])
@@ -114,13 +115,14 @@ def phase_inspire(prov_code: str, prov_nom: str):
     df.sort_values("Score", ascending=False, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    csv_inspire = f"{prov_nom.lower()}_provincia_prospects.csv"
+    base = output_name if output_name else f"{prov_nom.lower()}_provincia"
+    csv_inspire = f"{base}_prospects.csv"
     df.to_csv(csv_inspire, index=False)
     print(f"\n  -> {csv_inspire} ({len(df):,} candidats uniques)")
     return df
 
 
-def phase_ovc(df: pd.DataFrame, prov_code: str, prov_nom: str):
+def phase_ovc(df: pd.DataFrame, prov_code: str, prov_nom: str, output_name: str = None):
     cp = Path(f"cp_provincia_{prov_code}_ovc.json")
     state = json.loads(cp.read_text()) if cp.exists() else {"done": [], "rows": []}
     done = set(state["done"])
@@ -190,7 +192,8 @@ def phase_ovc(df: pd.DataFrame, prov_code: str, prov_nom: str):
     df_out.sort_values("Score", ascending=False, inplace=True)
     df_out.reset_index(drop=True, inplace=True)
 
-    csv_final = f"{prov_nom.lower()}_provincia_vivienda01.csv"
+    base = output_name if output_name else f"{prov_nom.lower()}_provincia"
+    csv_final = f"{base}_vivienda01.csv"
     df_out.to_csv(csv_final, index=False)
 
     print(f"\n{'='*60}")
@@ -211,14 +214,15 @@ def main():
         sys.exit(1)
 
     prov_code, prov_nom = resolve_province(sys.argv[1])
+    output_name = sys.argv[2] if len(sys.argv) > 2 else None
     print(f"\nPipeline complet : province de {prov_nom} ({prov_code})\n")
 
-    df = phase_inspire(prov_code, prov_nom)
+    df = phase_inspire(prov_code, prov_nom, output_name=output_name)
 
     if df is None:
         return
 
-    phase_ovc(df, prov_code, prov_nom)
+    phase_ovc(df, prov_code, prov_nom, output_name=output_name)
 
 
 if __name__ == "__main__":
